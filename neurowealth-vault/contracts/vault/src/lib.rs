@@ -491,6 +491,11 @@ impl BlendPoolClient {
     ) -> i128 {
         use soroban_sdk::{vec, IntoVal, Symbol};
 
+        // Track vault balance before to calculate actual supplied amount
+        let token_client = token::Client::new(env, asset);
+        let vault_address = env.current_contract_address();
+        let balance_before = token_client.balance(&vault_address);
+
         // Create supply request (type 0 = supply)
         let request = BlendRequest {
             request_type: BLEND_REQUEST_TYPE_SUPPLY,
@@ -515,7 +520,11 @@ impl BlendPoolClient {
             args,
         );
 
-        amount
+        // Calculate actual amount supplied by balance change
+        let balance_after = token_client.balance(&vault_address);
+        let actual_supplied = balance_before.saturating_sub(balance_after);
+
+        actual_supplied
     }
 
     /// Redeems assets from the Blend pool.
@@ -530,6 +539,11 @@ impl BlendPoolClient {
         to: &Address,
     ) -> i128 {
         use soroban_sdk::{vec, IntoVal, Symbol};
+
+        // Track vault balance before to calculate actual withdrawn amount
+        let token_client = token::Client::new(env, asset);
+        let vault_address = env.current_contract_address();
+        let balance_before = token_client.balance(&vault_address);
 
         // Create withdraw request (type 1 = withdraw)
         let request = BlendRequest {
@@ -550,7 +564,11 @@ impl BlendPoolClient {
         // Invoke Blend's submit function
         env.invoke_contract::<Val>(pool_address, &Symbol::new(env, "submit"), args);
 
-        amount
+        // Calculate actual amount withdrawn by balance change
+        let balance_after = token_client.balance(&vault_address);
+        let actual_withdrawn = balance_after.saturating_sub(balance_before);
+
+        actual_withdrawn
     }
 
     /// Gets the balance of assets supplied to the Blend pool.
@@ -908,7 +926,8 @@ impl NeuroWealthVault {
         // We use actual_to_return to determine how many shares to burn.
         // If Blend returned less than needed, the user will receive a partial
         // withdrawal and keep their remaining shares.
-        let shares_to_burn = Self::convert_to_shares_internal(&env, actual_to_return);
+        // Use ceiling division to prevent dust attacks (ensure at least 1 share burned when assets > 0).
+        let shares_to_burn = Self::convert_to_shares_internal_ceil(&env, actual_to_return);
         assert!(shares_to_burn > 0, "vault: shares to burn must be positive");
         assert!(
             user_shares >= shares_to_burn,
@@ -1076,7 +1095,8 @@ impl NeuroWealthVault {
                 if available_usdc < entitled_amount {
                     usdc_to_return = available_usdc;
                     assert!(usdc_to_return > 0, "vault: no liquidity available");
-                    shares_to_burn = Self::convert_to_shares_internal(&env, usdc_to_return);
+                    // Use ceiling division to prevent dust attacks (ensure at least 1 share burned).
+                    shares_to_burn = Self::convert_to_shares_internal_ceil(&env, usdc_to_return);
                 }
             }
         }
@@ -1206,7 +1226,30 @@ impl NeuroWealthVault {
 
         // If switching protocols, withdraw from current protocol first
         if current_protocol != protocol && current_protocol != symbol_short!("none") {
-            let _ = Self::withdraw_from_protocol(&env, &current_protocol);
+            // Get expected balance before withdrawal for verification
+            let expected_withdrawal = Self::get_protocol_balance(&env, &current_protocol);
+
+            let withdrawn = Self::withdraw_from_protocol(&env, &current_protocol);
+
+            // CRITICAL: Verify complete protocol exit before proceeding
+            // Check that: (1) we withdrew what was expected, AND (2) protocol balance is now 0
+            // This prevents partial transitions where funds get stuck in the old protocol
+            if expected_withdrawal > 0 {
+                assert!(
+                    withdrawn >= expected_withdrawal,
+                    "vault: incomplete protocol exit - expected {}, got {}. aborting rebalance to prevent inconsistent state",
+                    expected_withdrawal,
+                    withdrawn
+                );
+
+                // Double-check that protocol balance is actually 0
+                let remaining_balance = Self::get_protocol_balance(&env, &current_protocol);
+                assert!(
+                    remaining_balance == 0,
+                    "vault: protocol exit incomplete - {} still deployed after withdrawal. aborting rebalance",
+                    remaining_balance
+                );
+            }
         }
 
         // Supply to new protocol if switching to Blend
@@ -1236,7 +1279,28 @@ impl NeuroWealthVault {
             );
         } else if protocol == symbol_short!("none") {
             if current_protocol != symbol_short!("none") {
-                let _ = Self::withdraw_from_protocol(&env, &current_protocol);
+                // Get expected balance before withdrawal for verification
+                let expected_withdrawal = Self::get_protocol_balance(&env, &current_protocol);
+
+                let withdrawn = Self::withdraw_from_protocol(&env, &current_protocol);
+
+                // CRITICAL: Verify complete protocol exit before clearing protocol state
+                if expected_withdrawal > 0 {
+                    assert!(
+                        withdrawn >= expected_withdrawal,
+                        "vault: incomplete protocol exit - expected {}, got {}. aborting transition to none",
+                        expected_withdrawal,
+                        withdrawn
+                    );
+
+                    // Double-check that protocol balance is actually 0
+                    let remaining_balance = Self::get_protocol_balance(&env, &current_protocol);
+                    assert!(
+                        remaining_balance == 0,
+                        "vault: protocol exit incomplete - {} still deployed after withdrawal. aborting transition to none",
+                        remaining_balance
+                    );
+                }
             }
             env.storage()
                 .instance()
@@ -2532,6 +2596,7 @@ impl NeuroWealthVault {
     }
 
     /// Internal helper: convert assets (USDC) to shares using current totals.
+    /// Uses floor division - safe for deposits (user gets fewer shares, vault benefits).
     #[inline]
     fn convert_to_shares_internal(env: &Env, assets: i128) -> i128 {
         if assets == 0 {
@@ -2550,6 +2615,32 @@ impl NeuroWealthVault {
                 .expect("vault: conversion mul overflow")
                 .checked_div(total_assets)
                 .expect("vault: conversion div error")
+        }
+    }
+
+    /// Internal helper: convert assets (USDC) to shares using current totals.
+    /// Uses ceiling division - safe for withdrawals (user burns more shares, vault benefits).
+    /// Prevents dust attacks where floor division could result in 0 shares burned.
+    #[inline]
+    fn convert_to_shares_internal_ceil(env: &Env, assets: i128) -> i128 {
+        if assets == 0 {
+            return 0;
+        }
+
+        let total_shares = Self::get_total_shares_internal(env);
+        let total_assets = Self::get_total_assets_internal(env);
+
+        if total_shares == 0 || total_assets == 0 {
+            // Bootstrap: 1:1 mapping between assets and shares
+            // Ceiling of assets is just assets (assets >= 1)
+            assets
+        } else {
+            // Ceiling division: (a + b - 1) / b
+            // shares = ceil(assets * total_shares / total_assets)
+            let product = assets.checked_mul(total_shares).expect("vault: conversion mul overflow");
+            // Safe addition: total_assets >= 1 in this branch, so (product + total_assets - 1) won't overflow if product didn't
+            let numerator = product.checked_add(total_assets - 1).expect("vault: conversion add overflow");
+            numerator.checked_div(total_assets).expect("vault: conversion div error")
         }
     }
 
@@ -2789,6 +2880,31 @@ impl NeuroWealthVault {
         if current_protocol == *protocol && *protocol == symbol_short!("blend") {
             // Withdraw all funds from Blend
             Self::withdraw_from_blend(env, 0)
+        } else {
+            0
+        }
+    }
+
+    /// Internal helper: Gets the balance deployed to a specific protocol.
+    ///
+    /// Used to verify complete protocol exit during rebalancing.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `protocol` - The protocol symbol to check
+    ///
+    /// # Returns
+    /// The amount deployed to the protocol, or 0 if not deployed
+    fn get_protocol_balance(env: &Env, protocol: &Symbol) -> i128 {
+        if *protocol == symbol_short!("blend") {
+            let pool_address: Option<Address> = env.storage().instance().get(&DataKey::BlendPool);
+            if let Some(pool) = pool_address {
+                let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
+                let vault_address = env.current_contract_address();
+                BlendPoolClient::get_balance(env, &pool, &usdc_token, &vault_address)
+            } else {
+                0
+            }
         } else {
             0
         }

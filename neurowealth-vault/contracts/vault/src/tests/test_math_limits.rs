@@ -58,7 +58,8 @@ fn test_conversion_overflow() {
     let client = NeuroWealthVaultClient::new(&env, &contract_id);
 
     let user = Address::generate(&env);
-    // Deposit some amount
+
+    // Test normal conversion scenarios
     mint_and_deposit(&env, &client, &usdc_token, &user, 10_000_000);
 
     // We want to trigger assets.checked_mul(total_shares).expect("vault: conversion mul overflow")
